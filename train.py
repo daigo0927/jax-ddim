@@ -1,5 +1,4 @@
 import argparse
-from tqdm import tqdm
 from pathlib import Path
 from typing import Tuple, Any
 from datetime import datetime
@@ -7,19 +6,18 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 from flax.training import train_state
 from flax.training.checkpoints import save_checkpoint
 import optax
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
+from tqdm import tqdm
 
 from model import DiffusionModel
 
 
 def create_output_dir(output_dir: Path) -> Tuple[Path, Path, Path]:
-    output_dir = output_dir / datetime.now().strftime('%Y%m%d-%H%M%S')
     ckpt_dir = output_dir / 'models'
     log_dir = output_dir / 'logs'
     
@@ -78,10 +76,6 @@ class TrainState(train_state.TrainState):
     batch_stats: Any
 
 
-def model(**kwargs):
-    return DiffusionModel(**kwargs)
-
-
 def l1_loss(predictions, targets):
     return jnp.abs(predictions - targets)
 
@@ -117,21 +111,12 @@ def train_step(state, batch, rng):
     return state, loss
         
 
-@jax.jit
-def evaluate(params,
-             batch_stats,
-             rng,
-             n_images: int,
-             image_size: Tuple[int, int],
-             diffusion_steps: int):
-    def eval_fn(model):
-        # TODO: quantitative metrics
-        image_shape = (n_images, *image_size, 3)
-        generated_images = model.generate(rng, image_shape, diffusion_steps)
-        return generated_images
-
-    variables = {'params': params, 'batch_stats': batch_stats}
-    return nn.apply(eval_fn, model())(variables)
+@partial(jax.jit, static_argnums=4)
+def evaluate(model, variables, rng, batch, diffusion_steps: int):
+    generated_images = model.apply(variables,
+                                   rng, batch.shape, diffusion_steps,
+                                   method=model.generate)
+    return generated_images
 
 
 def run(epochs: int,
@@ -152,11 +137,12 @@ def run(epochs: int,
     image_shape = (batch_size, image_size, image_size, 3)
     dummy = jnp.ones(image_shape, dtype=jnp.float32)
 
-    variables = model().init(key_init, dummy, key_diffusion,
-                             train=True)
+    model = DiffusionModel()
+    variables = model.init(key_init, dummy, key_diffusion,
+                           train=True)
 
     state = TrainState.create(
-        apply_fn=model().apply,
+        apply_fn=model.apply,
         params=variables['params'],
         batch_stats=variables['batch_stats'],
         tx=optax.adamw(learning_rate, weight_decay=weight_decay)
@@ -166,7 +152,8 @@ def run(epochs: int,
 
     for epoch in range(epochs):
         losses = []
-        for images in (pbar := tqdm(ds_train, desc=f'Epoch {epoch}')):
+        pbar = tqdm(ds_train, desc=f'Epoch {epoch}')
+        for images in pbar:
             rng_train, key = jax.random.split(rng_train)
             state, loss = train_step(state, images, key)
 
@@ -174,11 +161,12 @@ def run(epochs: int,
             losses.append(loss)
             ema_params = jax.tree_map(update_ema, ema_params, state.params)
 
-        generated_images = evaluate(ema_params,
-                                    state.batch_stats,
+        variables_val = {'params': ema_params,
+                         'batch_stats': state.batch_stats}
+        generated_images = evaluate(model,
+                                    variables=variables_val,
                                     rng=rng_val,
-                                    n_images=batch_size,
-                                    image_size=(image_size, image_size),
+                                    batch=dummy,
                                     diffusion_steps=val_diffusion_steps)
 
         with summary_writer.as_default():
@@ -195,8 +183,10 @@ if __name__ == '__main__':
     parser.add_argument('-b', '--batch-size', type=int, default=64)
     parser.add_argument('-lr', '--learning-rate', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
-    parser.add_argument('--val-diffusion-steps', type=int, default=20)
-    parser.add_argument('-o', '--output-dir', type=Path, default='./outputs')
+    parser.add_argument('--val-diffusion-steps', type=int, default=80)
+    now = datetime.now().strftime('%Y%m%d-%H%M%S')
+    parser.add_argument('-o', '--output-dir', type=Path,
+                        default=f'./outputs/{now}')
 
     args = parser.parse_args()
 
