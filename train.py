@@ -126,6 +126,8 @@ def run(epochs: int,
         weight_decay: float,
         val_diffusion_steps: int,
         output_dir: Path):
+    tf.config.experimental.set_visible_devices([], 'GPU')
+    
     output_dir, ckpt_dir, log_dir = create_output_dir(output_dir)
     summary_writer = tf.summary.create_file_writer(str(log_dir))
     
