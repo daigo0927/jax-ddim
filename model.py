@@ -120,50 +120,22 @@ class UNet(nn.Module):
 
 
 class Normalization(nn.Module):
-    momentum: float = 0.99
-    epsilon: float = 1e-5
+    mean = jnp.array([0.5, 0.5, 0.5])
+    var = jnp.array([0.5, 0.5, 0.5])
+    epsilon = 1e-5
 
-    @nn.compact
-    def __call__(self, images, use_running_average: bool):
-        is_initialized = self.has_variable('batch_stats', 'mean')
-        
-        feature_shape = [images.shape[-1]]
-        ra_mean = self.variable('batch_stats', 'mean',
-                                lambda s: jnp.zeros(s, images.dtype),
-                                feature_shape)
-        ra_var = self.variable('batch_stats', 'var',
-                               lambda s: jnp.ones(s, images.dtype),
-                               feature_shape)
-
-        if use_running_average:
-            mean, var = ra_mean.value, ra_var.value
-        else:
-            reduction_axes = (0, 1, 2)
-            mean = jnp.mean(images, axis=reduction_axes)
-            mean2 = jnp.mean(jnp.square(images), axis=reduction_axes)
-            var = jnp.maximum(0.0, mean2 - jnp.square(mean))
-
-            if not is_initialized:
-                ra_mean.value = self.momentum * ra_mean.value \
-                    + (1 - self.momentum) * mean
-                ra_var.value = self.momentum*ra_var.value \
-                    + (1 - self.momentum) * var
-
-        mean = mean.reshape((1, 1, 1, -1))
-        var = var.reshape((1, 1, 1, -1))
+    def __call__(self, images):
+        mean = self.mean.reshape((1, 1, 1, -1)).astype(images.dtype)
+        var = self.var.reshape((1, 1, 1, -1)).astype(images.dtype)
         std = jnp.sqrt(var + self.epsilon)
         return (images - mean) / std
     
     def denormalize(self, x):
-        mean = self.variables['batch_stats']['mean']
-        var = self.variables['batch_stats']['var']
-
-        mean = mean.reshape((1, 1, 1, -1))
-        var = var.reshape((1, 1, 1, -1))
+        mean = self.mean.reshape((1, 1, 1, -1)).astype(x.dtype)
+        var = self.var.reshape((1, 1, 1, -1)).astype(x.dtype)
         std = jnp.sqrt(var + self.epsilon)
-
         return std*x + mean
-
+    
 
 class DiffusionModel(nn.Module):
     # UNet parameters
@@ -178,11 +150,6 @@ class DiffusionModel(nn.Module):
     min_signal_rate: float = 0.02
     max_signal_rate: float = 0.95
 
-    # image normalization parameters
-    # default values transform [0, 1] -> [-1, 1]
-    image_mean = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float32)
-    image_std = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float32)    
-    
     def setup(self):
         self.normalizer = Normalization()
         self.network = UNet(feature_stages=self.feature_stages,
@@ -192,33 +159,21 @@ class DiffusionModel(nn.Module):
                             embedding_dims=self.embedding_dims)
 
     def __call__(self, images, rng, train: bool):
+        images = self.normalizer(images)
+        
         rng_noises, rng_times = jax.random.split(rng)
-        
-        # images = self.normalize(images)
-        images = self.normalizer(images, use_running_average=not train)
         noises = jax.random.normal(rng_noises, images.shape, images.dtype)
-        
         diffusion_times = jax.random.uniform(rng_times,
                                              (images.shape[0], 1, 1, 1),
                                              images.dtype)
         noise_rates, signal_rates = self.diffusion_schedule(diffusion_times)
         noisy_images = signal_rates*images + noise_rates*noises
+        
         pred_noises, pred_images = self.denoise(noisy_images,
                                                 noise_rates,
                                                 signal_rates,
                                                 train=train)
         return noises, images, pred_noises, pred_images
-
-    # def normalize(self, images):
-    #     mean = jnp.reshape(self.image_mean, (1, 1, 1, -1))
-    #     std = jnp.reshape(self.image_std, (1, 1, 1, -1))
-    #     return (images - mean)/std
-
-    # def denormalize(self, images):
-    #     mean = jnp.reshape(self.image_mean, (1, 1, 1, -1))
-    #     std = jnp.reshape(self.image_std, (1, 1, 1, -1))
-    #     images = std*images + mean
-    #     return jnp.clip(images, 0.0, 1.0)
 
     def diffusion_schedule(self, diffusion_times):
         start_angle = jnp.arccos(self.max_signal_rate)
