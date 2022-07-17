@@ -112,10 +112,11 @@ def train_step(state, batch, rng):
         
 
 @partial(jax.jit, static_argnums=4)
-def evaluate(model, variables, rng, batch, diffusion_steps: int):
-    generated_images = model.apply(variables,
-                                   rng, batch.shape, diffusion_steps,
-                                   method=model.generate)
+def evaluate(state, params, rng, batch, diffusion_steps: int):
+    variables = {'params': params, 'batch_stats': state.batch_stats}
+    generated_images = state.apply_fn(variables,
+                                      rng, batch.shape, diffusion_steps,
+                                      method=DiffusionModel.generate)
     return generated_images
 
 
@@ -163,10 +164,8 @@ def run(epochs: int,
             losses.append(loss)
             ema_params = jax.tree_map(update_ema, ema_params, state.params)
 
-        variables_val = {'params': ema_params,
-                         'batch_stats': state.batch_stats}
-        generated_images = evaluate(model,
-                                    variables=variables_val,
+        generated_images = evaluate(state,
+                                    params=ema_params,
                                     rng=rng_val,
                                     batch=dummy,
                                     diffusion_steps=val_diffusion_steps)
