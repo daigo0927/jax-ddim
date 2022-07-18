@@ -119,24 +119,6 @@ class UNet(nn.Module):
         return x
 
 
-class Normalization(nn.Module):
-    mean = jnp.array([0.5, 0.5, 0.5])
-    var = jnp.array([0.5, 0.5, 0.5])
-    epsilon = 1e-5
-
-    def __call__(self, images):
-        mean = self.mean.reshape((1, 1, 1, -1)).astype(images.dtype)
-        var = self.var.reshape((1, 1, 1, -1)).astype(images.dtype)
-        std = jnp.sqrt(var + self.epsilon)
-        return (images - mean) / std
-    
-    def denormalize(self, x):
-        mean = self.mean.reshape((1, 1, 1, -1)).astype(x.dtype)
-        var = self.var.reshape((1, 1, 1, -1)).astype(x.dtype)
-        std = jnp.sqrt(var + self.epsilon)
-        return std*x + mean
-    
-
 class DiffusionModel(nn.Module):
     # UNet parameters
     feature_stages: List[int] = field(default_factory=lambda:
@@ -151,7 +133,7 @@ class DiffusionModel(nn.Module):
     max_signal_rate: float = 0.95
 
     def setup(self):
-        self.normalizer = Normalization()
+        self.normalizer = nn.BatchNorm(use_bias=False, use_scale=False)
         self.network = UNet(feature_stages=self.feature_stages,
                             blocks=self.blocks,
                             min_freq=self.min_freq,
@@ -159,7 +141,7 @@ class DiffusionModel(nn.Module):
                             embedding_dims=self.embedding_dims)
 
     def __call__(self, images, rng, train: bool):
-        images = self.normalizer(images)
+        images = self.normalizer(images, use_running_average=not train)
         
         rng_noises, rng_times = jax.random.split(rng)
         noises = jax.random.normal(rng_noises, images.shape, images.dtype)
@@ -217,9 +199,16 @@ class DiffusionModel(nn.Module):
 
         return pred_images
 
+    def denormalize(self, x):
+        norm_stats = self.normalizer.variables['batch_stats']
+        mean = norm_stats['mean'].reshape((1, 1, 1, -1)).astype(x.dtype)
+        var = norm_stats['var'].reshape((1, 1, 1, -1)).astype(x.dtype)
+        std = jnp.sqrt(var + self.normalizer.epsilon)
+        return std * x + mean
+
     def generate(self, rng, image_shape, diffusion_steps: int):
         initial_noise = jax.random.normal(rng, image_shape)
         generated_images = self.reverse_diffusion(initial_noise,
                                                   diffusion_steps)
-        generated_images = self.normalizer.denormalize(generated_images)
+        generated_images = self.denormalize(generated_images)
         return jnp.clip(generated_images, 0.0, 1.0)
